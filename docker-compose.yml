@@ -4,8 +4,8 @@ services:
   topic-generator:
     build: .
     environment:
-      - NUM_SUBTOPICS=2  # Change this value as needed
-      - NUM_SUBSUBTOPICS=2  # Change this value as needed
+      - NUM_SUBTOPICS=15  # Change this value as needed
+      - NUM_SUBSUBTOPICS=10  # Change this value as needed
       - OPENAI_API_KEY=${OPENAI_API_KEY}  # Will be taken from environment variable
     volumes:
       - ./input:/app/input  # Mount input directory

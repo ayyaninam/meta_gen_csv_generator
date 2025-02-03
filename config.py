@@ -1,4 +1,4 @@
-OPENAI_API_KEY = "YOUR KEY "
+OPENAI_API_KEY = "KEY"
 
 # OpenAI Model Settings
 MODEL_NAME = "gpt-4o-mini"
