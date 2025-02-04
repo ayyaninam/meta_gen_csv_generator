@@ -1,4 +1,4 @@
-OPENAI_API_KEY = "KEY"
+OPENAI_API_KEY = "YOUR_KEY_HERE"
 
 # OpenAI Model Settings
 MODEL_NAME = "gpt-4o-mini"
@@ -19,7 +19,7 @@ STATIC_KEYWORDS = [
 ]
 
 # Input/Output Files
-INPUT_CSV = "Complete_Topics_and_Subtopics.csv"
+INPUT_CSV = "Generated_Topics.csv"
 OUTPUT_CSV = "Generated_Topics.csv"
 
 # Content Generation Controls
