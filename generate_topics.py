@@ -1,20 +1,21 @@
 import pandas as pd
 from openai import OpenAI
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Any, Optional
 import config
 import prompts
 import content_prompts
 import logging
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Manager
 import time
 import itertools
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from threading import Lock
 import os
 import shutil
 import glob
 import sys
+import tqdm
+import numpy as np
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,18 +39,14 @@ def generate_subtopics(client: OpenAI, main_topic: str, num_subtopics: int) -> L
     logging.info(f"Generating {num_subtopics} subtopics for '{main_topic}'")
     prompt = prompts.get_subtopic_prompt(main_topic, num_subtopics)
     response = call_gpt(client, prompt)
-    print(response)
     topics = [topic.strip() for topic in response.split("|||")]
-    logging.info(f"Generated subtopics: {topics}")
     return topics
 
 def generate_subsubtopics(client: OpenAI, main_topic: str, sub_topic: str, num_subsubtopics: int) -> List[str]:
     logging.info(f"Generating {num_subsubtopics} sub-subtopics for '{sub_topic}'")
     prompt = prompts.get_subsubtopic_prompt(main_topic, sub_topic, num_subsubtopics)
     response = call_gpt(client, prompt)
-    print(response)
     topics = [topic.strip() for topic in response.split("|||")]
-    logging.info(f"Generated sub-subtopics: {topics}")
     return topics
 
 def generate_keywords(client: OpenAI, main_topic: str, sub_topic: str, sub_sub_topic: str) -> List[str]:
@@ -58,20 +55,21 @@ def generate_keywords(client: OpenAI, main_topic: str, sub_topic: str, sub_sub_t
     response = call_gpt(client, prompt)
     keywords = [kw.strip() for kw in response.split("|||")]
     all_keywords = config.STATIC_KEYWORDS + keywords
-    logging.info(f"Generated keywords: {all_keywords}")
     return all_keywords
 
-def generate_content_sequential(client: OpenAI, main_topic: str, sub_topic: str, sub_sub_topic: str, content_type: str) -> str:
-    """Generate a single type of content"""
+def generate_content_item(client: OpenAI, main_topic: str, sub_topic: str, sub_sub_topic: str, content_type: str, existing_keywords: Optional[List[str]] = None) -> Tuple[str, Optional[List[str]]]:
+    """Generate a single content item and return it along with any generated keywords"""
     try:
+        # For keywords content type
         if content_type == 'keywords':
-            prompt = content_prompts.get_keywords_prompt(main_topic, sub_topic, sub_sub_topic)
-            return call_gpt(client, prompt)
+            keywords = generate_keywords(client, main_topic, sub_topic, sub_sub_topic)
+            return ' ||| '.join(keywords), keywords
             
-        # Get keywords for other content types
-        keywords = call_gpt(client, content_prompts.get_keywords_prompt(main_topic, sub_topic, sub_sub_topic))
-        keywords_list = [k.strip() for k in keywords.split('|||')]
-        
+        # For other content types, ensure we have keywords
+        keywords_list = existing_keywords
+        if not keywords_list:
+            keywords_list = generate_keywords(client, main_topic, sub_topic, sub_sub_topic)
+            
         # Map content types to their prompt functions
         prompt_map = {
             'image_title': content_prompts.get_image_title,
@@ -85,59 +83,85 @@ def generate_content_sequential(client: OpenAI, main_topic: str, sub_topic: str,
         }
         
         if content_type in prompt_map:
-            prompt = prompt_map[content_type](sub_sub_topic, keywords_list)
-            return call_gpt(client, prompt)
+            # Special handling for long description to ensure uniqueness
+            if content_type == 'long_description':
+                full_topic = f"{sub_sub_topic} (in the context of {sub_topic} under {main_topic})"
+                prompt = prompt_map[content_type](full_topic, keywords_list)
+            else:
+                prompt = prompt_map[content_type](sub_sub_topic, keywords_list)
+                
+            content = call_gpt(client, prompt)
+            return content, keywords_list
             
-        return ''
+        return '', keywords_list
         
     except Exception as e:
         logging.error(f"Error generating {content_type}: {str(e)}")
-        return f"Error generating {content_type}"
+        return f"Error generating {content_type}", None
 
-def process_single_column(df: pd.DataFrame, content_type: str, csv_column: str) -> pd.DataFrame:
-    """Process a single content column for all rows"""
+def process_subtopic_task(args) -> List[str]:
+    """Worker function for parallel subtopic generation"""
+    main_topic, num_subtopics = args
     client = setup_openai()
-    total_rows = len(df)
+    return generate_subtopics(client, main_topic, num_subtopics)
+
+def process_subsubtopic_task(args) -> Tuple[str, str, List[str]]:
+    """Worker function for parallel sub-subtopic generation"""
+    main_topic, sub_topic, num_subsubtopics = args
+    client = setup_openai()
+    subsubtopics = generate_subsubtopics(client, main_topic, sub_topic, num_subsubtopics)
+    return main_topic, sub_topic, subsubtopics
+
+def process_content_generation_task(args) -> Dict[str, Any]:
+    """Worker function for parallel content generation for a single row"""
+    row_dict, content_types_to_generate, column_name_map = args
     
-    logging.info(f"\nStarting processing of {csv_column}")
-    logging.info(f"Total rows to process: {total_rows}")
+    client = setup_openai()
+    results = row_dict.copy()
     
-    # Create a copy of the DataFrame to work with
-    working_df = df.copy()
+    # Skip rows with missing required fields
+    if not all(pd.notna(row_dict.get(field)) for field in ['Main Topic', 'Sub-Topic', 'Sub-Sub-Topic']):
+        return results
     
-    for index, row in working_df.iterrows():
-        try:
-            # Skip if content already exists
-            if pd.notna(row.get(csv_column)) and row.get(csv_column).strip():
-                logging.info(f"Row {index + 1}/{total_rows}: Content exists, skipping")
-                continue
-                
-            # Skip if missing required fields
-            if not all(pd.notna(row.get(field)) for field in ['Main Topic', 'Sub-Topic', 'Sub-Sub-Topic']):
-                logging.info(f"Row {index + 1}/{total_rows}: Missing required fields, skipping")
-                continue
-                
-            logging.info(f"Row {index + 1}/{total_rows}: Generating {csv_column}")
-            content = generate_content_sequential(
-                client,
-                row['Main Topic'],
-                row['Sub-Topic'],
-                row['Sub-Sub-Topic'],
-                content_type
-            )
-            
-            working_df.at[index, csv_column] = content
-            
-            # Save intermediate results every 10 rows
-            if (index + 1) % 10 == 0:
-                working_df.to_csv(config.OUTPUT_CSV, index=False)
-                logging.info(f"Saved intermediate results after {index + 1} rows")
-                
-        except Exception as e:
-            logging.error(f"Error processing row {index + 1}: {str(e)}")
+    main_topic = row_dict['Main Topic']
+    sub_topic = row_dict['Sub-Topic']
+    sub_sub_topic = row_dict['Sub-Sub-Topic']
+    
+    # Extract existing keywords if available
+    existing_keywords = None
+    if pd.notna(row_dict.get('Keywords')):
+        existing_keywords = row_dict['Keywords'].split(' ||| ') if isinstance(row_dict['Keywords'], str) else None
+    
+    # Process each content type
+    for content_type in content_types_to_generate:
+        column_name = column_name_map[content_type]
+        
+        # Skip if content already exists
+        if pd.notna(results.get(column_name)) and str(results.get(column_name)).strip():
             continue
-            
-    return working_df
+        
+        # Generate the content
+        content, keywords = generate_content_item(
+            client, 
+            main_topic, 
+            sub_topic, 
+            sub_sub_topic, 
+            content_type, 
+            existing_keywords
+        )
+        
+        # Update results
+        results[column_name] = content
+        
+        # If keywords were generated, update the Keywords column and our cached keywords
+        if content_type == 'keywords' and keywords:
+            results['Keywords'] = ' ||| '.join(keywords)
+            existing_keywords = keywords
+        elif not existing_keywords and keywords:
+            existing_keywords = keywords
+            results['Keywords'] = ' ||| '.join(keywords)
+    
+    return results
 
 def cleanup_backup_files():
     """Clean up backup and checkpoint files"""
@@ -157,142 +181,166 @@ def cleanup_backup_files():
     except Exception as e:
         logging.warning(f"Error cleaning up backup files: {str(e)}")
 
-def process_subtopics(df: pd.DataFrame, client: OpenAI, num_subtopics: int) -> pd.DataFrame:
-    """Process all subtopics first"""
-    logging.info("\nProcessing all subtopics...")
-    working_df = df.copy()
+def generate_topics_in_parallel(df: pd.DataFrame, num_subtopics: int, num_subsubtopics: int) -> pd.DataFrame:
+    """Generate all topics in parallel"""
+    logging.info("\nGenerating topics in parallel...")
     
-    for index, row in working_df.iterrows():
+    # Filter for rows that need subtopics
+    main_topics_to_process = []
+    for index, row in df.iterrows():
         main_topic = row['Main Topic']
-        if not isinstance(main_topic, str) or not main_topic.strip():
-            continue
-            
-        if pd.isna(row['Sub-Topic']):
-            logging.info(f"Generating subtopics for: {main_topic}")
-            subtopics = generate_subtopics(client, main_topic, num_subtopics)
-            # Store all subtopics in the first row, we'll expand them later
-            working_df.at[index, 'Sub-Topic'] = ' ||| '.join(subtopics)
-            
-            # Save progress
-            working_df.to_csv(f"{config.OUTPUT_CSV}.subtopics", index=False)
+        if isinstance(main_topic, str) and main_topic.strip() and pd.isna(row.get('Sub-Topic')):
+            main_topics_to_process.append((main_topic, num_subtopics))
     
-    return working_df
-
-def process_subsubtopics(df: pd.DataFrame, client: OpenAI, num_subsubtopics: int) -> pd.DataFrame:
-    """Process all sub-subtopics after subtopics are done"""
-    logging.info("\nProcessing all sub-subtopics...")
+    if not main_topics_to_process:
+        logging.info("No main topics need subtopic generation. Skipping.")
+        return df
+        
+    logging.info(f"Generating subtopics for {len(main_topics_to_process)} main topics in parallel")
+    
+    # Process subtopics in parallel
+    num_workers = min(max(1, cpu_count()), len(main_topics_to_process))
     results = []
     
-    for index, row in df.iterrows():
-        main_topic = row['Main Topic']
-        if not isinstance(main_topic, str) or not main_topic.strip():
-            continue
-            
-        subtopics = row['Sub-Topic'].split(' ||| ')
-        for subtopic_num, subtopic in enumerate(subtopics, 1):
-            logging.info(f"Generating sub-subtopics for: {main_topic} -> {subtopic}")
-            subsubtopics = generate_subsubtopics(client, main_topic, subtopic, num_subsubtopics)
-            
-            for subsubtopic_num, subsubtopic in enumerate(subsubtopics, 1):
-                new_row = row.copy()
-                new_row['Serial Number'] = f"{row['Serial Number']}.{subtopic_num}.{subsubtopic_num}"
-                new_row['Sub-Topic'] = subtopic
-                new_row['Sub-Sub-Topic'] = subsubtopic
-                results.append(new_row)
-                
-            # Save progress after each subtopic
-            temp_df = pd.DataFrame(results)
-            temp_df.to_csv(f"{config.OUTPUT_CSV}.subsubtopics", index=False)
-    
-    return pd.DataFrame(results)
-
-def process_column(df: pd.DataFrame, client: OpenAI, column_name: str, content_type: str) -> pd.DataFrame:
-    """Process a single column for all rows"""
-    logging.info(f"\nProcessing column: {column_name}")
-    total_rows = len(df)
-    
-    for index, row in df.iterrows():
-        try:
-            # Skip if content already exists and is not empty
-            if pd.notna(row[column_name]) and str(row[column_name]).strip():
-                logging.info(f"Row {index + 1}/{total_rows}: Content exists for {column_name}, skipping")
-                continue
-                
-            # Skip if missing required fields
-            if pd.isna(row['Main Topic']) or pd.isna(row['Sub-Topic']) or pd.isna(row['Sub-Sub-Topic']):
-                logging.info(f"Row {index + 1}/{total_rows}: Missing required fields, skipping")
-                continue
-            
-            logging.info(f"Processing {column_name} for row {index + 1}/{total_rows}")
-            
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_subtopic_task, args) for args in main_topics_to_process]
+        
+        for i, future in enumerate(as_completed(futures)):
+            main_topic = main_topics_to_process[i][0]
             try:
-                # Generate keywords first if needed
-                if content_type != 'keywords':
-                    # Try to get existing keywords or generate new ones
-                    if pd.isna(row['Keywords']) or not str(row['Keywords']).strip():
-                        keywords = generate_keywords(client, row['Main Topic'], row['Sub-Topic'], row['Sub-Sub-Topic'])
-                        df.at[index, 'Keywords'] = ' ||| '.join(keywords)
-                        keywords_list = keywords
-                    else:
-                        keywords_list = str(row['Keywords']).split(' ||| ') if pd.notna(row['Keywords']) else config.STATIC_KEYWORDS
+                subtopics = future.result()
+                logging.info(f"Generated {len(subtopics)} subtopics for '{main_topic}'")
                 
-                # Generate content based on type
-                if content_type == 'keywords':
-                    content = ' ||| '.join(generate_keywords(client, row['Main Topic'], row['Sub-Topic'], row['Sub-Sub-Topic']))
-                else:
-                    prompt_map = {
-                        'image_title': content_prompts.get_image_title,
-                        'image_alt': content_prompts.get_image_alt,
-                        'image_caption': content_prompts.get_image_caption,
-                        'image_description': content_prompts.get_image_description,
-                        'page_title': content_prompts.get_page_title,
-                        'meta_description': content_prompts.get_meta_description,
-                        'short_description': content_prompts.get_short_description,
-                        'long_description': content_prompts.get_long_description
-                    }
+                # Filter the main topic row
+                main_topic_row = None
+                for _, row in df.iterrows():
+                    if row['Main Topic'] == main_topic and pd.isna(row.get('Sub-Topic')):
+                        main_topic_row = row
+                        break
+                
+                if main_topic_row is not None:
+                    # Now process subsubtopics for this main topic
+                    subsubtopic_tasks = [(main_topic, subtopic, num_subsubtopics) for subtopic in subtopics]
                     
-                    prompt_func = prompt_map[content_type]
+                    # Make sure we have at least one worker
+                    sub_workers = min(max(1, cpu_count()), len(subsubtopic_tasks))
                     
-                    # Special handling for long description to ensure uniqueness
-                    if content_type == 'long_description':
-                        # Include hierarchy information in the prompt
-                        full_topic = f"{row['Sub-Sub-Topic']} (in the context of {row['Sub-Topic']} under {row['Main Topic']})"
-                        content = call_gpt(client, prompt_func(full_topic, keywords_list))
-                        
-                        # Verify the content is unique
-                        existing_descriptions = df[df['Long Description'].notna()]['Long Description'].tolist()
-                        similarity_threshold = 0.7  # Adjust this value if needed
-                        
-                        # If content is too similar to existing descriptions, regenerate with higher temperature
-                        retry_count = 0
-                        while any(similar_text(content, existing) > similarity_threshold for existing in existing_descriptions) and retry_count < 3:
-                            logging.info(f"Generated content too similar to existing, retrying with higher temperature ({retry_count + 1}/3)")
-                            response = client.chat.completions.create(
-                                model=config.MODEL_NAME,
-                                messages=[{"role": "user", "content": prompt_func(full_topic, keywords_list)}],
-                                temperature=min(1.0, config.TEMPERATURE + 0.1 * (retry_count + 1))
-                            )
-                            content = response.choices[0].message.content.strip()
-                            retry_count += 1
-                    else:
-                        content = call_gpt(client, prompt_func(row['Sub-Sub-Topic'], keywords_list))
-                
-                df.at[index, column_name] = content
-                
-                # Save progress every 5 rows
-                if (index + 1) % 5 == 0:
-                    df.to_csv(config.OUTPUT_CSV, index=False)
-                    logging.info(f"Saved progress after {index + 1} rows")
-                
-            except Exception as e:
-                logging.error(f"Error generating content for row {index + 1} in {column_name}: {str(e)}")
-                continue
+                    sub_futures = []
+                    with ProcessPoolExecutor(max_workers=sub_workers) as sub_executor:
+                        sub_futures = [sub_executor.submit(process_subsubtopic_task, args) for args in subsubtopic_tasks]
+                    
+                        for j, sub_future in enumerate(as_completed(sub_futures)):
+                            try:
+                                main_t, subtopic, subsubtopics = sub_future.result()
+                                
+                                for k, subsubtopic in enumerate(subsubtopics):
+                                    new_row = main_topic_row.copy()
+                                    new_row['Serial Number'] = f"{new_row['Serial Number']}.{j+1}.{k+1}"
+                                    new_row['Sub-Topic'] = subtopic
+                                    new_row['Sub-Sub-Topic'] = subsubtopic
+                                    results.append(new_row)
+                                    
+                            except Exception as e:
+                                logging.error(f"Error processing subsubtopics: {str(e)}")
             
-        except Exception as e:
-            logging.error(f"Error processing row {index + 1} for {column_name}: {str(e)}")
-            continue
+            except Exception as e:
+                logging.error(f"Error processing subtopics for '{main_topic}': {str(e)}")
+    
+    # Add new rows to dataframe
+    if results:
+        new_rows_df = pd.DataFrame(results)
+        df = pd.concat([df, new_rows_df], ignore_index=True)
+        
+        # Save progress
+        df.to_csv(config.OUTPUT_CSV, index=False)
+        logging.info(f"Added {len(results)} new rows with generated topics")
+    else:
+        logging.info("No new topics were generated.")
     
     return df
+
+def process_content_in_parallel(df: pd.DataFrame) -> pd.DataFrame:
+    """Process all content generation in parallel"""
+    logging.info("\nProcessing content generation in parallel...")
+    
+    # Define column mapping
+    column_mapping = {
+        'keywords': 'Keywords',
+        'image_title': 'Image Title',
+        'image_alt': 'Image Alt Text',
+        'image_caption': 'Image Caption',
+        'image_description': 'Image Description',
+        'page_title': 'Page Title',
+        'meta_description': 'Page Meta Description',
+        'short_description': 'Short Description',
+        'long_description': 'Long Description'
+    }
+    
+    # Determine which content types to generate
+    content_types_to_generate = [k for k, v in config.GENERATE_CONTENT.items() if v]
+    
+    # Skip processing if nothing to generate
+    if not content_types_to_generate:
+        logging.info("No content types selected for generation. Skipping.")
+        return df
+    
+    # Convert DataFrame to list of dictionaries for parallel processing
+    rows_to_process = df.to_dict('records')
+    
+    # Check if we have rows to process
+    if not rows_to_process:
+        logging.info("No rows to process. Skipping content generation.")
+        return df
+    
+    # Prepare tasks
+    tasks = [(row, content_types_to_generate, column_mapping) for row in rows_to_process]
+    
+    # Determine number of workers (don't exceed available CPUs or number of tasks)
+    num_workers = min(max(config.MAX_PROCESSES, cpu_count()), len(tasks))
+    
+    logging.info(f"Processing {len(tasks)} rows with {num_workers} workers")
+    
+    # Create progress bar
+    progress_bar = tqdm.tqdm(total=len(tasks), desc="Processing rows")
+    
+    # Process in parallel
+    results = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_task = {executor.submit(process_content_generation_task, task): i for i, task in enumerate(tasks)}
+        
+        # Process results as they complete
+        for future in as_completed(future_to_task):
+            task_index = future_to_task[future]
+            try:
+                result = future.result()
+                results.append(result)
+                
+                # Update progress bar
+                progress_bar.update(1)
+                
+                # Save intermediate results periodically
+                if len(results) % 10 == 0:
+                    # Create a temporary dataframe from results processed so far
+                    temp_df = pd.DataFrame(results)
+                    # Save to a temporary file to avoid conflicts
+                    temp_filename = f"{config.OUTPUT_CSV}.temp"
+                    temp_df.to_csv(temp_filename, index=False)
+                    # Rename to actual output file
+                    shutil.move(temp_filename, config.OUTPUT_CSV)
+                    logging.info(f"Saved intermediate results after processing {len(results)} rows")
+                    
+            except Exception as e:
+                logging.error(f"Error processing row {task_index}: {str(e)}")
+                # Add the original row to maintain the count
+                results.append(tasks[task_index][0])
+    
+    progress_bar.close()
+    
+    # Create final dataframe from results
+    final_df = pd.DataFrame(results)
+    
+    return final_df
 
 def similar_text(text1: str, text2: str) -> float:
     """Calculate similarity between two texts using simple word overlap"""
@@ -314,12 +362,19 @@ def process_csv(num_subtopics: int, num_subsubtopics: int):
             shutil.copy2(config.OUTPUT_CSV, f"{config.OUTPUT_CSV}.backup")
             logging.info(f"Created backup at: {config.OUTPUT_CSV}.backup")
         except FileNotFoundError:
-            df = pd.read_csv(config.INPUT_CSV)
-            logging.info("Starting with fresh input file")
+            # Ensure the input file exists
+            if not os.path.exists(config.INPUT_CSV):
+                logging.error(f"Input file {config.INPUT_CSV} not found!")
+                # Create an empty DataFrame with required columns
+                df = pd.DataFrame(columns=['Serial Number', 'Main Topic', 'Sub-Topic', 'Sub-Sub-Topic'])
+                logging.info("Created empty DataFrame with required columns")
+            else:
+                df = pd.read_csv(config.INPUT_CSV)
+                logging.info(f"Starting with fresh input file containing {len(df)} rows")
             
         # Ensure all required columns exist
         required_columns = [
-            'Main Topic', 'Sub-Topic', 'Sub-Sub-Topic',
+            'Serial Number', 'Main Topic', 'Sub-Topic', 'Sub-Sub-Topic',
             'Keywords', 'Image Title', 'Image Alt Text',
             'Image Caption', 'Image Description', 'Page Title',
             'Page Meta Description', 'Short Description', 'Long Description'
@@ -328,120 +383,42 @@ def process_csv(num_subtopics: int, num_subsubtopics: int):
         for col in required_columns:
             if col not in df.columns:
                 df[col] = ''
+                
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(config.OUTPUT_CSV)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            logging.info(f"Created output directory: {output_dir}")
+                
+        # Check if we have main topics to process
+        if 'Main Topic' not in df.columns or df['Main Topic'].isna().all():
+            logging.warning("No main topics found in the input file!")
+            # If we still want to proceed, create a sample main topic
+            if config.PROCESS_NEW_TOPICS and num_subtopics > 0:
+                sample_topic = "PowerPoint Templates"
+                df = pd.DataFrame([{'Serial Number': '1', 'Main Topic': sample_topic}])
+                logging.info(f"Created sample main topic: {sample_topic}")
+            else:
+                logging.error("Cannot proceed without main topics and PROCESS_NEW_TOPICS is disabled")
+                return
 
-        client = setup_openai()
-
-        # First, check if we need to generate new topics
+        # Generate new topics if needed
         if config.PROCESS_NEW_TOPICS and (num_subtopics > 0 or num_subsubtopics > 0):
-            new_rows = []
+            df = generate_topics_in_parallel(df, num_subtopics, num_subsubtopics)
             
-            # Get existing combinations to avoid duplicates
-            existing_combinations = set()
-            for _, row in df.iterrows():
-                if pd.notna(row['Sub-Topic']) and pd.notna(row['Sub-Sub-Topic']):
-                    existing_combinations.add((row['Main Topic'], row['Sub-Topic'], row['Sub-Sub-Topic']))
+            # Remove rows that don't have both Sub-Topic and Sub-Sub-Topic
+            df = df.dropna(subset=['Sub-Topic', 'Sub-Sub-Topic'])
             
-            # Process each main topic for new combinations
-            for index, row in df.iterrows():
-                main_topic = row['Main Topic']
-                if not isinstance(main_topic, str) or not main_topic.strip():
-                    continue
-                
-                # If row has no sub-topic, generate everything
-                if pd.isna(row['Sub-Topic']) or not row['Sub-Topic'].strip():
-                    logging.info(f"\nProcessing Main Topic: {main_topic}")
-                    subtopics = generate_subtopics(client, main_topic, num_subtopics)
-                    
-                    for i, subtopic in enumerate(subtopics, 1):
-                        subsubtopics = generate_subsubtopics(client, main_topic, subtopic, num_subsubtopics)
-                        
-                        for j, subsubtopic in enumerate(subsubtopics, 1):
-                            if (main_topic, subtopic, subsubtopic) not in existing_combinations:
-                                new_row = row.copy()
-                                new_row['Serial Number'] = f"{row['Serial Number']}.{i}.{j}"
-                                new_row['Sub-Topic'] = subtopic
-                                new_row['Sub-Sub-Topic'] = subsubtopic
-                                new_rows.append(new_row)
-                                existing_combinations.add((main_topic, subtopic, subsubtopic))
-                
-                # If row has sub-topic but no sub-sub-topic, generate only sub-sub-topics
-                elif pd.isna(row['Sub-Sub-Topic']) or not row['Sub-Sub-Topic'].strip():
-                    subtopic = row['Sub-Topic']
-                    logging.info(f"\nGenerating sub-sub-topics for: {main_topic} -> {subtopic}")
-                    subsubtopics = generate_subsubtopics(client, main_topic, subtopic, num_subsubtopics)
-                    
-                    for j, subsubtopic in enumerate(subsubtopics, 1):
-                        if (main_topic, subtopic, subsubtopic) not in existing_combinations:
-                            new_row = row.copy()
-                            new_row['Serial Number'] = f"{row['Serial Number']}.{j}"
-                            new_row['Sub-Sub-Topic'] = subsubtopic
-                            new_rows.append(new_row)
-                            existing_combinations.add((main_topic, subtopic, subsubtopic))
-            
-            # Add all new rows and remove original empty rows
-            if new_rows:
-                df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-                # Remove rows that don't have both Sub-Topic and Sub-Sub-Topic
-                df = df.dropna(subset=['Sub-Topic', 'Sub-Sub-Topic'])
-                # Save progress
-                df.to_csv(config.OUTPUT_CSV, index=False)
-                logging.info(f"Added {len(new_rows)} new topic combinations")
-
-        # Generate keywords for all rows that have sub-topics and sub-sub-topics but no keywords
-        logging.info("\nGenerating keywords for existing topics...")
-        rows_updated = 0
-        
-        for index, row in df.iterrows():
-            try:
-                # Check if row has both sub-topic and sub-sub-topic
-                if pd.notna(row['Sub-Topic']) and pd.notna(row['Sub-Sub-Topic']):
-                    # Check if keywords are missing or empty
-                    if pd.isna(row.get('Keywords', '')) or not str(row.get('Keywords', '')).strip():
-                        main_topic = str(row['Main Topic'])
-                        sub_topic = str(row['Sub-Topic'])
-                        sub_sub_topic = str(row['Sub-Sub-Topic'])
-                        
-                        logging.info(f"Generating keywords for: {main_topic} -> {sub_topic} -> {sub_sub_topic}")
-                        
-                        # Generate keywords
-                        keywords = generate_keywords(client, main_topic, sub_topic, sub_sub_topic)
-                        df.at[index, 'Keywords'] = ' ||| '.join(keywords)
-                        rows_updated += 1
-                        
-                        # Save progress every 5 rows
-                        if rows_updated % 5 == 0:
-                            df.to_csv(config.OUTPUT_CSV, index=False)
-                            logging.info(f"Saved progress after updating {rows_updated} rows")
-                            
-            except Exception as e:
-                logging.error(f"Error generating keywords for row {index + 1}: {str(e)}")
-                continue
-
-        # Save final progress after keywords generation
-        if rows_updated > 0:
+            # Save progress
             df.to_csv(config.OUTPUT_CSV, index=False)
-            logging.info(f"Completed generating keywords for {rows_updated} rows")
-            
-        # Step 2: Process each content column one by one
-        content_columns = [
-            ('image_title', 'Image Title'),
-            ('image_alt', 'Image Alt Text'),
-            ('image_caption', 'Image Caption'),
-            ('image_description', 'Image Description'),
-            ('page_title', 'Page Title'),
-            ('meta_description', 'Page Meta Description'),
-            ('short_description', 'Short Description'),
-            ('long_description', 'Long Description')
-        ]
+            logging.info("Completed topic generation phase")
+
+        # Process all content in parallel
+        df = process_content_in_parallel(df)
         
-        for content_type, column_name in content_columns:
-            if config.GENERATE_CONTENT[content_type]:
-                df = process_column(df, client, column_name, content_type)
-                # Save after completing each column
-                df.to_csv(config.OUTPUT_CSV, index=False)
-                logging.info(f"Completed processing column: {column_name}")
-        
-        logging.info("\nAll content generation completed")
+        # Save final results
+        df.to_csv(config.OUTPUT_CSV, index=False)
+        logging.info("All content generation completed")
         
         # Clean up backup files
         cleanup_backup_files()

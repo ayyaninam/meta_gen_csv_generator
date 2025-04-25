@@ -1,4 +1,4 @@
-OPENAI_API_KEY = "YOUR_KEY_HERE"
+OPENAI_API_KEY = ""
 
 # OpenAI Model Settings
 MODEL_NAME = "gpt-4o-mini"
@@ -19,12 +19,12 @@ STATIC_KEYWORDS = [
 ]
 
 # Input/Output Files
-INPUT_CSV = "Generated_Topics.csv"
-OUTPUT_CSV = "Generated_Topics.csv"
+INPUT_CSV = "input/Generated_Topics.csv"
+OUTPUT_CSV = "output/Generated_Topics.csv"
 
 # Content Generation Controls
 PROCESS_NEW_TOPICS = True  # Set to False to only process existing topics
-
+MAX_PROCESSES = 75
 # Content Generation Toggles - Set which content to generate
 GENERATE_CONTENT = {
     'keywords': True,

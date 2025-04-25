@@ -6,6 +6,8 @@ output/
 input/
 # C extensions
 *.so
+input
+output
 
 # Distribution / packaging
 .Python
